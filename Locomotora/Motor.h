@@ -16,8 +16,18 @@ namespace Locomotora
 		SDL_Window* window = NULL;
 		SDL_WindowFlags window_flags = NULL;
 		SDL_Renderer* renderer = NULL;
+
+
 		bool running = false;
 		std::unordered_set<std::string> escenasGuardadas;
+
+		class Proyecto {
+			public:
+			std::string nombre;
+			std::string ruta;
+			Proyecto(const std::string& n, const std::string& r) : nombre(n), ruta(r) {};
+		};
+
 		class Escena {
 		public:
 			std::string nombre;
@@ -42,5 +52,7 @@ namespace Locomotora
 		void NetejarEscenaActiva();
 		void DesarEscena(const std::string& fitxer);
 		void CarregarEscena(const std::string& fitxer);
+		/*void CrearProyecto(const std::string& nom, const std::string& rute);
+		void CarregarProyecto(const std::string& rute);*/
 	};
 }

@@ -16,6 +16,9 @@
 #include "../libs/emscripten/emscripten_mainloop_stub.h"
 #endif
 
+#include <string>
+#include <iostream>
+
 
 using namespace Locomotora;
 
@@ -34,7 +37,6 @@ void Motor::CambiarEscena(const std::string& nom) {
 void Motor::NetejarEscenaActiva() {
     if (activa) activa->netejar();
 }
-
 std::unordered_set<std::string> escenasGuardadas;
 
 void Motor::DesarEscena(const std::string& fitxer) {
@@ -248,6 +250,10 @@ void Motor::Run() {
 
             static bool showCrearPopup = false;
             static char nuevaEscenaNombre[128] = "";
+
+            static bool showProjectPopup = false;
+            static char nuevoProyectoNombre[128] = "";
+            static char nuevoProyectoRuta[128] = "";
             static std::unordered_map<Escena*, std::vector<char>> nuevosNodos;
             static Escena* seleccionado = nullptr;
 
@@ -295,6 +301,8 @@ void Motor::Run() {
                 iniciado = true;
             }
 
+            if (ImGui::Button("Crear Proyecto")) { showProjectPopup = true; nuevaEscenaNombre[0] = '\0'; }
+            ImGui::SameLine();
             if (ImGui::Button("Crear Escena")) { showCrearPopup = true; nuevaEscenaNombre[0] = '\0'; }
             ImGui::SameLine();
             if (ImGui::Button("Limpiar Escena Activa")) NetejarEscenaActiva();
@@ -308,6 +316,22 @@ void Motor::Run() {
                     if (strlen(nuevaEscenaNombre) > 0) {
                         CrearEscena(nuevaEscenaNombre);
                         activa = escenas[nuevaEscenaNombre];
+                        seleccionado = activa;
+                        ImGui::CloseCurrentPopup();
+                    }
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Cancelar")) ImGui::CloseCurrentPopup();
+                ImGui::EndPopup();
+            }
+
+            if (showProjectPopup) { ImGui::OpenPopup("Crear nuevo proyecto"); showProjectPopup = false; }
+            if (ImGui::BeginPopupModal("Crear nuevo proyecto", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+                if (ImGui::InputText("Nombre", nuevoProyectoNombre, IM_ARRAYSIZE(nuevoProyectoNombre), ImGuiInputTextFlags_EnterReturnsTrue)
+                    || ImGui::Button("Crear")) {
+                    if (strlen(nuevoProyectoNombre) > 0) {
+                        //CrearProyecto(nuevoProyectoNombre);
+                        activa = escenas[nuevoProyectoNombre];
                         seleccionado = activa;
                         ImGui::CloseCurrentPopup();
                     }
