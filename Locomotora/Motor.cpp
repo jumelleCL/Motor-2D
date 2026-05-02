@@ -1,513 +1,790 @@
 #include "Motor.h"
-#include "Vector.h"
-
 #include "imgui.h"
 #include "imgui_impl_sdl3.h"
 #include "imgui_impl_sdlrenderer3.h"
-#include <stdio.h>
-#include <unordered_map>
+#include <filesystem>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
 #include <sstream>
+#include <algorithm>
+#include <functional>
 
-
-
-#define SDL_RenderFillRectF SDL_RenderFillRect
-
-#ifdef __EMSCRIPTEN__
-#include "../libs/emscripten/emscripten_mainloop_stub.h"
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <shobjidl_core.h>
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "uuid.lib")
+#pragma comment(lib, "shell32.lib")
 #endif
-
-#include <string>
-#include <iostream>
-
 
 using namespace Locomotora;
 
-void Motor::CrearEscena(const std::string& nom) {
-    if (escenas.find(nom) == escenas.end()) {
-        escenas[nom] = new Escena();
-        escenas[nom]->nombre = nom;
-    }
+static std::string Utf8FromWide(const std::wstring& wide)
+{
+#ifdef _WIN32
+    if (wide.empty()) return {};
+    int size = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    std::string utf8(size - 1, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, utf8.data(), size, nullptr, nullptr);
+    return utf8;
+#else
+    return {};
+#endif
 }
 
-void Motor::CambiarEscena(const std::string& nom) {
-    auto it = escenas.find(nom);
-    if (it != escenas.end()) activa = it->second;
-}
-
-void Motor::NetejarEscenaActiva() {
-    if (activa) activa->netejar();
-}
-std::unordered_set<std::string> escenasGuardadas;
-
-void Motor::DesarEscena(const std::string& fitxer) {
-    if (!activa) return;
-    std::ofstream f(fitxer);
-    if (!f.is_open()) return;
-    std::vector<std::pair<Escena*, int>> stack;
-    stack.push_back(std::make_pair(activa, 0));
-    while (!stack.empty()) {
-        std::pair<Escena*, int> p = stack.back();
-        stack.pop_back();
-        Escena* e = p.first;
-        int nivel = p.second;
-        for (int i = 0; i < nivel; ++i) f << "\t";
-        f << e->nombre << " " << e->posicion.x << " " << e->posicion.y << " "
-            << e->rotacion << " " << e->rotacion << " "
-            << e->escala.x << " " << e->escala.y << "\n";
-        for (auto it = e->hijos.rbegin(); it != e->hijos.rend(); ++it) {
-            stack.push_back(std::make_pair(*it, nivel + 1));
+#ifdef _WIN32
+static std::string SeleccionarImagenWindows()
+{
+    IFileOpenDialog* dialogo = nullptr;
+    std::string resultado;
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    bool coOk = SUCCEEDED(hr);
+    hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&dialogo));
+    if (SUCCEEDED(hr))
+    {
+        COMDLG_FILTERSPEC filtros[] = { { L"Imágenes", L"*.png;*.jpg;*.jpeg;*.bmp;*.tga" }, { L"Todos", L"*.*" } };
+        dialogo->SetTitle(L"Elegir imagen");
+        dialogo->SetFileTypes(2, filtros);
+        dialogo->SetOptions(FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST);
+        hr = dialogo->Show(nullptr);
+        if (SUCCEEDED(hr))
+        {
+            IShellItem* item = nullptr;
+            if (SUCCEEDED(dialogo->GetResult(&item)))
+            {
+                PWSTR ruta = nullptr;
+                if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &ruta)))
+                {
+                    resultado = Utf8FromWide(ruta);
+                    CoTaskMemFree(ruta);
+                }
+                item->Release();
+            }
         }
+        dialogo->Release();
     }
-    escenasGuardadas.insert(activa->nombre);
+    if (coOk) CoUninitialize();
+    return resultado;
+}
+#endif
+
+Motor& Motor::Instance()
+{
+    static Motor instancia;
+    return instancia;
 }
 
-void Motor::CarregarEscena(const std::string& fitxer) {
-    std::ifstream f(fitxer);
-    if (!f.is_open()) return;
-    std::string line;
-    std::vector<Escena*> stack;
-    while (std::getline(f, line)) {
-        int nivel = 0;
-        while (!line.empty() && line[0] == '\t') { nivel++; line.erase(0, 1); }
-        std::istringstream iss(line);
-        std::string nom;
-        float px, py, rx, ry, sx, sy;
-        iss >> nom >> px >> py >> rx >> ry >> sx >> sy;
-        Escena* e = new Escena();
-        e->nombre = nom;
-        e->posicion = Punt{ px, py };
-        e->rotacion = float{ rx };
-        e->escala = Vector{ sx, sy };
-        if (nivel == 0) {
-            escenas[e->nombre] = e;
-            escenasGuardadas.insert(e->nombre);
-            stack.clear();
-            stack.push_back(e);
-        }
-        else {
-            while (stack.size() > nivel) stack.pop_back();
-            e->padre = stack.back();
-            stack.back()->hijos.push_back(e);
-            stack.push_back(e);
-        }
-    }
-}
-
-
-
-
-int Motor::Init() {
+int Motor::Init()
+{
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD))
-    {
-        printf("Error: SDL_Init(): %s\n", SDL_GetError());
         return -1;
-    }
-
-    main_scale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
-    window_flags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN | SDL_WINDOW_HIGH_PIXEL_DENSITY;
-
-    window = SDL_CreateWindow("Dear ImGui SDL3+OpenGL3 example", (int)(1280 * main_scale), (int)(800 * main_scale), window_flags);
-    if (window == nullptr)
-    {
-        printf("Error: SDL_CreateWindow(): %s\n", SDL_GetError());
-        return -1;
-    }
-
-    renderer = SDL_CreateRenderer(window, nullptr);
+    escalaPantalla = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
+    ventana = SDL_CreateWindow("Motor", (int)(1280 * escalaPantalla), (int)(720 * escalaPantalla), SDL_WINDOW_RESIZABLE);
+    if (!ventana) return -1;
+    renderer = SDL_CreateRenderer(ventana, nullptr);
+    if (!renderer) return -1;
     SDL_SetRenderVSync(renderer, 1);
-    if (renderer == nullptr)
-    {
-        SDL_Log("Error: SDL_CreateRenderer(): %s\n", SDL_GetError());
-        return 1;
-    }
-
-    SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
-    SDL_ShowWindow(window);
-
-    IMGUI_CHECKVERSION();
+    SDL_ShowWindow(ventana);
     ImGui::CreateContext();
-    ImGuiIO& io = ImGui::GetIO(); (void)io;
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
-
-    ImGui::StyleColorsDark();
-
-    ImGuiStyle& style = ImGui::GetStyle();
-    style.ScaleAllSizes(main_scale);
-    style.FontScaleDpi = main_scale;
-
-    ImGui_ImplSDL3_InitForSDLRenderer(window, renderer);
+    ImGui_ImplSDL3_InitForSDLRenderer(ventana, renderer);
     ImGui_ImplSDLRenderer3_Init(renderer);
-
     return 0;
 }
 
-void Motor::Run() {
+void Motor::liberar()
+{
+    for (auto& par : niveles)
+        delete par.second;
+    niveles.clear();
+    nivelActivo = nullptr;
+}
 
-    bool vector_window = false;
-    bool menu = true;
-	bool main = true;
+std::string Motor::RutaNivel(const std::string& nombre) const
+{
+    return (std::filesystem::path(rutaProyecto) / (nombre + ".txt")).string();
+}
 
+bool Motor::CrearProyecto(const std::string& ruta)
+{
+    if (ruta.empty()) return false;
+    CerrarProyecto();
+    rutaProyecto = ruta;
+    nombreProyecto = std::filesystem::path(ruta).filename().string();
+    std::error_code ec;
+    std::filesystem::create_directories(rutaProyecto, ec);
+    std::filesystem::create_directories(std::filesystem::path(rutaProyecto) / "assets", ec);
+    proyectoAbierto = std::filesystem::exists(rutaProyecto);
+    if (proyectoAbierto)
+        CrearEscena("Nivel1");
+    return proyectoAbierto;
+}
 
-    ImGuiIO& io = ImGui::GetIO(); (void)io;
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
-
-
-    ImVec4 clear_color = ImVec4(0.45f, 0.55f, 0.60f, 1.00f);
-
-    running = true;
-    while (running) {
-
-
-        SDL_Event event;
-        while (SDL_PollEvent(&event))
+bool Motor::AbrirProyecto(const std::string& ruta)
+{
+    if (ruta.empty()) return false;
+    if (!std::filesystem::exists(ruta)) return false;
+    CerrarProyecto();
+    rutaProyecto = ruta;
+    nombreProyecto = std::filesystem::path(ruta).filename().string();
+    proyectoAbierto = true;
+    for (const auto& entrada : std::filesystem::directory_iterator(rutaProyecto))
+    {
+        if (!entrada.is_regular_file()) continue;
+        if (entrada.path().extension() != ".txt") continue;
+        if (entrada.path().filename() == "project.txt") continue;
+        std::string nombreNivel = entrada.path().stem().string();
+        Escena* nuevaEscena = new Escena();
+        nuevaEscena->rutaBase = rutaProyecto;
+        if (nuevaEscena->Cargar(entrada.path().string()))
         {
-            ImGui_ImplSDL3_ProcessEvent(&event);
-            if (event.type == SDL_EVENT_QUIT)
-                running = false;
-            if (event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED && event.window.windowID == SDL_GetWindowID(window))
-                running = false;
-
-            // [ Inputs ]
-
+            if (nuevaEscena->nombre.empty()) nuevaEscena->nombre = nombreNivel;
+            nuevaEscena->raiz->nombre = nuevaEscena->nombre;
+            niveles[nombreNivel] = nuevaEscena;
+            if (!nivelActivo) nivelActivo = nuevaEscena;
         }
+        else
+        {
+            delete nuevaEscena;
+        }
+    }
+    return true;
+}
 
+void Motor::CerrarProyecto()
+{
+    liberar();
+    rutaProyecto.clear();
+    nombreProyecto.clear();
+    proyectoAbierto = false;
+    modoJuego = false;
+
+    nodoSeleccionado = nullptr;
+    if (texturaPanel)
+    {
+        SDL_DestroyTexture(texturaPanel);
+        texturaPanel = nullptr;
+    }
+    anchoTextura = altoTextura = 0;
+    rutaArchivoSeleccionado.clear();
+    nombreAccionPendiente.clear();
+    accionPendiente = AccionPendiente::Ninguna;
+    errorNombreDuplicado = false;
+    popupEliminarNivel = false;
+    nivelAEliminar.clear();
+    popupEliminarArchivo = false;
+    archivoAEliminar.clear();
+    memset(bufferNivel, 0, sizeof(bufferNivel));
+    memset(bufferNombreNodo, 0, sizeof(bufferNombreNodo));
+}
+
+void Motor::CrearEscena(const std::string& nombre)
+{
+    if (!proyectoAbierto || nombre.empty()) return;
+    if (niveles.count(nombre)) return;
+    Escena* nueva = new Escena();
+    nueva->nombre = nombre;
+    nueva->raiz->nombre = nombre;
+    nueva->rutaBase = rutaProyecto;
+    niveles[nombre] = nueva;
+    nivelActivo = nueva;
+    GuardarEscenaActual();
+    nivelActivo->modificado = false;
+}
+
+void Motor::CambiarEscena(const std::string& nombre)
+{
+    auto iter = niveles.find(nombre);
+    if (iter != niveles.end())
+        nivelActivo = iter->second;
+}
+
+void Motor::GuardarEscenaActual()
+{
+    if (!proyectoAbierto || !nivelActivo) return;
+    nivelActivo->Guardar(RutaNivel(nivelActivo->nombre));
+    nivelActivo->modificado = false;
+}
+
+void Motor::EliminarEscena(const std::string& nombre)
+{
+    if (!proyectoAbierto) return;
+    auto iter = niveles.find(nombre);
+    if (iter == niveles.end()) return;
+    if (nivelActivo == iter->second)
+        nivelActivo = nullptr;
+    delete iter->second;
+    niveles.erase(iter);
+    std::filesystem::remove(RutaNivel(nombre));
+    if (nivelActivo == nullptr && !niveles.empty())
+        nivelActivo = niveles.begin()->second;
+}
+
+bool Motor::CopiarAssetAlProyecto(const std::string& origen, std::string& destinoRelativo) const
+{
+    if (origen.empty() || rutaProyecto.empty()) return false;
+    std::filesystem::path src(origen);
+    if (!std::filesystem::exists(src)) return false;
+    std::filesystem::path carpetaAssets = std::filesystem::path(rutaProyecto) / "assets";
+    std::error_code ec;
+    std::filesystem::create_directories(carpetaAssets, ec);
+    std::filesystem::path dst = carpetaAssets / src.filename();
+    int contador = 1;
+    while (std::filesystem::exists(dst))
+        dst = carpetaAssets / (src.stem().string() + "_" + std::to_string(contador++) + src.extension().string());
+    std::filesystem::copy_file(src, dst, std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec) return false;
+    destinoRelativo = (std::filesystem::path("assets") / dst.filename()).generic_string();
+    return true;
+}
+
+static void DibujarArbolNodos(Nodo* nodo, Nodo*& seleccionado, Escena* escena)
+{
+    ImGui::PushID((void*)nodo);
+    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_DefaultOpen;
+    if (seleccionado == nodo) flags |= ImGuiTreeNodeFlags_Selected;
+    bool abierto = ImGui::TreeNodeEx(nodo->nombre.c_str(), flags);
+    if (ImGui::IsItemClicked())
+        seleccionado = nodo;
+    if (ImGui::BeginPopupContextItem())
+    {
+        if (ImGui::MenuItem("Eliminar nodo"))
+        {
+            if (nodo->padre)
+            {
+                auto& hijos = nodo->padre->hijos;
+                hijos.erase(std::remove(hijos.begin(), hijos.end(), nodo), hijos.end());
+                Escena::LiberarNodo(nodo);
+                seleccionado = escena->raiz;
+                escena->modificado = true;
+            }
+        }
+        ImGui::EndPopup();
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("+"))
+        escena->CrearNodo(nodo, "Nodo");
+    if (abierto)
+    {
+        for (auto* hijo : nodo->hijos)
+            DibujarArbolNodos(hijo, seleccionado, escena);
+        ImGui::TreePop();
+    }
+    ImGui::PopID();
+}
+
+static void DibujarEscenaEnTextura(SDL_Renderer* renderer, Escena* escena, SDL_Texture*& textura, int& anchoTex, int& altoTex, ImVec2 tamanoVentana, bool modoEditor)
+{
+    if (!escena) return;
+    if (tamanoVentana.x <= 1 || tamanoVentana.y <= 1) return;
+    int nuevoAncho = (int)tamanoVentana.x;
+    int nuevoAlto = (int)tamanoVentana.y;
+    if (!textura || anchoTex != nuevoAncho || altoTex != nuevoAlto)
+    {
+        if (textura) SDL_DestroyTexture(textura);
+        textura = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_BGRA8888, SDL_TEXTUREACCESS_TARGET, nuevoAncho, nuevoAlto);
+        anchoTex = nuevoAncho;
+        altoTex = nuevoAlto;
+    }
+    SDL_SetRenderTarget(renderer, textura);
+    SDL_SetRenderDrawColor(renderer, 48, 48, 52, 255);
+    SDL_RenderClear(renderer);
+    escena->Render(renderer, modoEditor);
+    SDL_SetRenderTarget(renderer, nullptr);
+}
+
+static void DibujarExploradorArchivos(const std::filesystem::path& directorioActual,
+    std::string& rutaSeleccionada,
+    const std::map<std::string, Escena*>& niveles,
+    const std::function<void(const std::string&)>& alAbrirNivel,
+    const std::function<void(const std::string&)>& alEliminarArchivo,
+    bool& abrirPopupEliminar, std::string& archivoAEliminar)
+{
+    ImGui::PushID(directorioActual.string().c_str());
+    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_DefaultOpen;
+    bool esRaiz = (directorioActual == std::filesystem::path());
+    std::string nombreMostrar = esRaiz ? "Proyecto" : directorioActual.filename().string();
+    bool abierto = ImGui::TreeNodeEx(nombreMostrar.c_str(), flags);
+    if (abierto)
+    {
+        std::error_code ec;
+        for (const auto& entrada : std::filesystem::directory_iterator(directorioActual, ec))
+        {
+            if (entrada.is_directory())
+            {
+                DibujarExploradorArchivos(entrada.path(), rutaSeleccionada, niveles, alAbrirNivel, alEliminarArchivo, abrirPopupEliminar, archivoAEliminar);
+            }
+            else if (entrada.is_regular_file())
+            {
+                std::string nombreArchivo = entrada.path().filename().string();
+                std::string extension = entrada.path().extension().string();
+                bool esNivel = (extension == ".txt");
+                bool esAsset = (extension == ".png" || extension == ".jpg" || extension == ".jpeg" || extension == ".bmp" || extension == ".tga");
+                if (esNivel || esAsset)
+                {
+                    ImGui::PushID(entrada.path().string().c_str());
+                    if (ImGui::Selectable(nombreArchivo.c_str(), rutaSeleccionada == entrada.path().string()))
+                    {
+                        rutaSeleccionada = entrada.path().string();
+                        if (ImGui::IsMouseDoubleClicked(0) && esNivel)
+                        {
+                            alAbrirNivel(entrada.path().stem().string());
+                        }
+                    }
+                    if (ImGui::BeginPopupContextItem())
+                    {
+                        if (esNivel)
+                        {
+                            if (ImGui::MenuItem("Abrir nivel"))
+                                alAbrirNivel(entrada.path().stem().string());
+                            if (ImGui::MenuItem("Eliminar nivel"))
+                            {
+                                archivoAEliminar = entrada.path().string();
+                                abrirPopupEliminar = true;
+                            }
+                        }
+                        ImGui::EndPopup();
+                    }
+                    ImGui::PopID();
+                }
+            }
+        }
+        ImGui::TreePop();
+    }
+    ImGui::PopID();
+}
+
+void Motor::Run()
+{
+    static char bufferRutaProyecto[256] = "";
+    Uint64 ultimoTiempo = SDL_GetTicks();
+
+    auto EjecutarAccionPendiente = [&]()
+        {
+            if (accionPendiente == AccionPendiente::CrearNivel)
+            {
+                CrearEscena(nombreAccionPendiente);
+                nodoSeleccionado = nivelActivo ? nivelActivo->raiz : nullptr;
+            }
+            else if (accionPendiente == AccionPendiente::CambiarNivel)
+            {
+                CambiarEscena(nombreAccionPendiente);
+                nodoSeleccionado = nivelActivo ? nivelActivo->raiz : nullptr;
+            }
+            accionPendiente = AccionPendiente::Ninguna;
+            nombreAccionPendiente.clear();
+        };
+
+    auto PedirCambioNivel = [&](const std::string& nombre, AccionPendiente accion)
+        {
+            if (nivelActivo && nivelActivo->modificado)
+            {
+                nombreAccionPendiente = nombre;
+                accionPendiente = accion;
+                ImGui::OpenPopup("Guardar cambios?");
+            }
+            else
+            {
+                nombreAccionPendiente = nombre;
+                accionPendiente = accion;
+                EjecutarAccionPendiente();
+            }
+        };
+
+    corriendo = true;
+    while (corriendo)
+    {
+        Uint64 ahora = SDL_GetTicks();
+        float deltaTime = (ahora - ultimoTiempo) / 1000.0f;
+        if (deltaTime > 0.05f) deltaTime = 0.05f;
+        ultimoTiempo = ahora;
+
+        SDL_Event evento;
+        while (SDL_PollEvent(&evento))
+        {
+            ImGui_ImplSDL3_ProcessEvent(&evento);
+            if (evento.type == SDL_EVENT_QUIT)
+                corriendo = false;
+        }
+        const bool* teclas = SDL_GetKeyboardState(nullptr);
+
+        if (modoJuego && nivelActivo)
+        {
+            nivelActivo->Update(deltaTime, teclas);
+            if (teclas[SDL_SCANCODE_ESCAPE])
+                modoJuego = false;
+        }
 
         ImGui_ImplSDLRenderer3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
 
-        if (menu)
-            ImGui::ShowDemoWindow(&menu);
-            {
-                ImGui::Begin("MENU");
-                ImGui::Checkbox("Vector y Punto test", &vector_window);
-                ImGui::End();
-
-            }
-
-
-        if (vector_window)
+        if (!proyectoAbierto)
         {
-            static Punt punto1{0, 0};
-            static Punt punto2{ 0, 0 };
-            static Vector v;
-            static bool show_ambdos = false;
-            static bool show_punt = false;
-            static bool show_vector = false;
-
-            ImGui::Begin("Punto y vectores lool", &vector_window);
-
-            ImGui::DragFloat("Punt 1 X", &punto1.x);
-            ImGui::DragFloat("Punt 1 Y", &punto1.y);
-            ImGui::DragFloat("Punt 2 X", &punto2.x);
-            ImGui::DragFloat("Punt 2 Y", &punto2.y);
-
-
-            Vector desplacament = punto1.desplacament(punto2);
-            Punt suma = punto1 + v;
-            Punt resta = punto1 - v;
-            float magni = desplacament.magnitud();
-            float magni_qua = desplacament.magnitud_quadrada();
-            Vector perp = desplacament.perpendicular();
-            Vector norm = desplacament.normalitzat();
-
-
-            if (ImGui::Button("Mostrar suma/resta")) show_ambdos = !show_ambdos;
-            if (show_ambdos)
+            ImGui::Begin("Motor");
+            ImGui::Text("No hay proyecto abierto");
+            ImGui::InputText("Ruta proyecto", bufferRutaProyecto, IM_ARRAYSIZE(bufferRutaProyecto));
+            if (ImGui::Button("Crear proyecto"))
             {
-                ImGui::SeparatorText("Operaciones Punt + Vector");
-                ImGui::Text("Suma -> (%.2f, %.2f)", suma.x, suma.y);
-                ImGui::Text("Resta -> (%.2f, %.2f)", resta.x, resta.y);
+                if (CrearProyecto(bufferRutaProyecto))
+                    bufferRutaProyecto[0] = '\0';
             }
-
-            if (ImGui::Button("Mostrar Punto")) show_punt = !show_punt;
-            if (show_punt)
+            ImGui::SameLine();
+            if (ImGui::Button("Abrir proyecto"))
             {
-                ImGui::SeparatorText("Desplazamiento");
-                ImGui::Text("Desplazamiento: (%.2f, %.2f)", desplacament.x, desplacament.y);
-                ImGui::Text("Magnitud: %.2f", magni);
-                ImGui::Text("Magnitud cuadrada: %.2f", magni_qua);
+                if (AbrirProyecto(bufferRutaProyecto))
+                    bufferRutaProyecto[0] = '\0';
             }
-
-            if (ImGui::Button("Mostrar Vector")) show_vector = !show_vector;
-            if (show_vector)
-            {
-                ImGui::SeparatorText("Vector info");
-                ImGui::Text("Perpendicular: (%.2f, %.2f)", perp.x, perp.y);
-                ImGui::Text("Normalizado: (%.2f, %.2f)", norm.x, norm.y);
-            }
-
             ImGui::End();
-            
         }
-
-        
-        if (main)
+        else
         {
-            ImGui::Begin("Locomotora");
+            ImGui::Begin("Motor");
+            ImGui::Text("Proyecto: %s", nombreProyecto.c_str());
+            if (!modoJuego)
+            {
+                if (ImGui::Button("Play"))
+                    modoJuego = true;
+                ImGui::SameLine();
+                if (ImGui::Button("Nuevo nivel"))
+                {
+                    bufferNivel[0] = '\0';
+                    errorNombreDuplicado = false;
+                    ImGui::OpenPopup("Crear nivel");
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Guardar nivel"))
+                    GuardarEscenaActual();
+                ImGui::SameLine();
+                if (ImGui::Button("Cerrar proyecto"))
+                {
+                    CerrarProyecto();
+                    nodoSeleccionado = nullptr;
+                    rutaArchivoSeleccionado.clear();
+                    if (texturaPanel)
+                    {
+                        SDL_DestroyTexture(texturaPanel);
+                        texturaPanel = nullptr;
+                        anchoTextura = altoTextura = 0;
+                    }
+                }
+            }
+            else
+            {
+                if (ImGui::Button("Stop"))
+                    modoJuego = false;
+            }
 
-            static bool showCrearPopup = false;
-            static char nuevaEscenaNombre[128] = "";
+            if (ImGui::BeginPopupModal("Crear nivel", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+            {
+                ImGui::InputText("Nombre", bufferNivel, IM_ARRAYSIZE(bufferNivel));
+                if (errorNombreDuplicado)
+                    ImGui::TextColored(ImVec4(1, 0, 0, 1), "Ya existe un nivel con ese nombre");
+                if (ImGui::Button("Crear"))
+                {
+                    std::string nuevoNombre = bufferNivel;
+                    if (nuevoNombre.empty())
+                        errorNombreDuplicado = false;
+                    else if (niveles.find(nuevoNombre) != niveles.end())
+                        errorNombreDuplicado = true;
+                    else
+                    {
+                        errorNombreDuplicado = false;
+                        PedirCambioNivel(nuevoNombre, AccionPendiente::CrearNivel);
+                        ImGui::CloseCurrentPopup();
+                    }
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Cancelar"))
+                {
+                    errorNombreDuplicado = false;
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::EndPopup();
+            }
 
-            static bool showProjectPopup = false;
-            static char nuevoProyectoNombre[128] = "";
-            static char nuevoProyectoRuta[128] = "";
-            static std::unordered_map<Escena*, std::vector<char>> nuevosNodos;
-            static Escena* seleccionado = nullptr;
+            if (ImGui::BeginPopupModal("Guardar cambios?", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+            {
+                ImGui::Text("El nivel actual tiene cambios sin guardar.");
+                if (ImGui::Button("Guardar y continuar"))
+                {
+                    GuardarEscenaActual();
+                    EjecutarAccionPendiente();
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("No guardar"))
+                {
+                    EjecutarAccionPendiente();
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Cancelar"))
+                {
+                    accionPendiente = AccionPendiente::Ninguna;
+                    nombreAccionPendiente.clear();
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::EndPopup();
+            }
 
-            static bool iniciado = false;
-            if (!iniciado) {
-                std::ifstream index("escenas.txt");
-                if (!index.is_open()) { std::ofstream("escenas.txt").close(); }
-                else {
-                    std::string nombre;
-                    while (std::getline(index, nombre)) {
-                        if (nombre.empty()) continue;
-                        Escena* e = new Escena();
-                        e->nombre = nombre;
-                        std::ifstream f(nombre + ".txt");
-                        if (f.is_open()) {
-                            std::string linea;
-                            std::vector<Escena*> stack;
-                            while (std::getline(f, linea)) {
-                                if (linea.empty()) continue;
-                                int nivel = 0; while (nivel < (int)linea.size() && linea[nivel] == '\t') nivel++;
-                                std::istringstream iss(linea.substr(nivel));
-                                std::string nodeName;
-                                float px, py, rx, ry, sx, sy;
-                                iss >> nodeName >> px >> py >> rx >> ry >> sx >> sy;
-                                Escena* nodo = new Escena();
-                                nodo->nombre = nodeName;
-                                nodo->posicion = Punt{ px, py };
-                                nodo->rotacion = float{ rx };
-                                nodo->escala = Vector{ sx, sy };
-                                if (nivel == 0) { e->hijos.push_back(nodo); nodo->padre = e; }
-                                else {
-                                    if ((int)stack.size() >= nivel) {
-                                        stack[nivel - 1]->hijos.push_back(nodo);
-                                        nodo->padre = stack[nivel - 1];
+            if (popupEliminarNivel)
+            {
+                ImGui::OpenPopup("Eliminar nivel##confirm");
+                popupEliminarNivel = false;
+            }
+            if (ImGui::BeginPopupModal("Eliminar nivel##confirm", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+            {
+                ImGui::Text("¿Eliminar nivel '%s'?", nivelAEliminar.c_str());
+                if (ImGui::Button("Si"))
+                {
+                    EliminarEscena(nivelAEliminar);
+                    nivelAEliminar.clear();
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("No"))
+                {
+                    nivelAEliminar.clear();
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::EndPopup();
+            }
+
+            if (popupEliminarArchivo)
+            {
+                ImGui::OpenPopup("Eliminar archivo##confirm");
+                popupEliminarArchivo = false;
+            }
+            if (ImGui::BeginPopupModal("Eliminar archivo##confirm", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+            {
+                ImGui::Text("¿Eliminar archivo '%s'?", std::filesystem::path(archivoAEliminar).filename().string().c_str());
+                if (ImGui::Button("Si"))
+                {
+                    std::string nombreSinExt = std::filesystem::path(archivoAEliminar).stem().string();
+                    if (niveles.find(nombreSinExt) != niveles.end())
+                        EliminarEscena(nombreSinExt);
+                    else
+                        std::filesystem::remove(archivoAEliminar);
+                    archivoAEliminar.clear();
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("No"))
+                {
+                    archivoAEliminar.clear();
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::EndPopup();
+            }
+
+            if (!modoJuego)
+            {
+                ImGui::Columns(3, nullptr, true);
+
+                ImGui::BeginChild("IzquierdaArriba", ImVec2(0, 260), true);
+                ImGui::Text("Nivel");
+                if (nivelActivo && nivelActivo->raiz)
+                {
+                    if (ImGui::Selectable(nivelActivo->raiz->nombre.c_str(), nodoSeleccionado == nivelActivo->raiz))
+                        nodoSeleccionado = nivelActivo->raiz;
+                    if (ImGui::Button("Crear hijo del nivel"))
+                        nivelActivo->CrearNodo(nivelActivo->raiz, "Nodo");
+                    ImGui::Separator();
+                    if (ImGui::TreeNode("Arbol de nodos"))
+                    {
+                        for (auto* hijo : nivelActivo->raiz->hijos)
+                            DibujarArbolNodos(hijo, nodoSeleccionado, nivelActivo);
+                        ImGui::TreePop();
+                    }
+                }
+                ImGui::EndChild();
+
+                ImGui::BeginChild("IzquierdaAbajo", ImVec2(0, 0), true);
+                ImGui::Text("Explorador del Proyecto");
+                std::filesystem::path rutaProyectoPath = rutaProyecto;
+                if (std::filesystem::exists(rutaProyectoPath))
+                {
+                    auto alAbrirNivel = [&](const std::string& nombre)
+                        {
+                            PedirCambioNivel(nombre, AccionPendiente::CambiarNivel);
+                        };
+                    auto alEliminarArchivo = [&](const std::string& archivo)
+                        {
+                            archivoAEliminar = archivo;
+                            popupEliminarArchivo = true;
+                        };
+                    DibujarExploradorArchivos(rutaProyectoPath, rutaArchivoSeleccionado, niveles,
+                        alAbrirNivel, alEliminarArchivo, popupEliminarArchivo, archivoAEliminar);
+                }
+                ImGui::EndChild();
+
+                ImGui::NextColumn();
+
+                ImGui::BeginChild("Centro", ImVec2(0, 0), true);
+                if (nivelActivo)
+                {
+                    ImVec2 tamano = ImGui::GetContentRegionAvail();
+                    DibujarEscenaEnTextura(renderer, nivelActivo, texturaPanel, anchoTextura, altoTextura, tamano, true);
+                    if (texturaPanel)
+                        ImGui::Image((ImTextureID)texturaPanel, tamano);
+                }
+                ImGui::EndChild();
+
+                ImGui::NextColumn();
+
+                ImGui::BeginChild("Derecha", ImVec2(0, 0), true);
+                if (nivelActivo && nodoSeleccionado && nodoSeleccionado != nivelActivo->raiz)
+                {
+                    std::snprintf(bufferNombreNodo, sizeof(bufferNombreNodo), "%s", nodoSeleccionado->nombre.c_str());
+                    if (ImGui::InputText("Nombre", bufferNombreNodo, IM_ARRAYSIZE(bufferNombreNodo)))
+                    {
+                        nodoSeleccionado->nombre = bufferNombreNodo;
+                        nivelActivo->modificado = true;
+                    }
+                    if (ImGui::DragFloat2("Posicion", &nodoSeleccionado->posicion.x, 1.0f))
+                        nivelActivo->modificado = true;
+                    if (ImGui::DragFloat2("Escala", &nodoSeleccionado->escala.x, 0.01f))
+                        nivelActivo->modificado = true;
+                    if (ImGui::DragFloat("Rotacion", &nodoSeleccionado->rotacion, 1.0f))
+                        nivelActivo->modificado = true;
+                    if (ImGui::Checkbox("Movimiento", &nodoSeleccionado->movement))
+                        nivelActivo->modificado = true;
+                    if (ImGui::Checkbox("Visible", &nodoSeleccionado->visible))
+                        nivelActivo->modificado = true;
+                    if (ImGui::DragFloat("Speed", &nodoSeleccionado->speed, 10.0f))
+                        nivelActivo->modificado = true;
+
+                    if (ImGui::Checkbox("Collision", &nodoSeleccionado->collision.enabled))
+                        nivelActivo->modificado = true;
+                    if (nodoSeleccionado->collision.enabled)
+                    {
+                        ImGui::Indent();
+                        if (ImGui::DragFloat2("Offset", &nodoSeleccionado->collision.offset.x, 1.0f))
+                            nivelActivo->modificado = true;
+                        if (ImGui::DragFloat2("Size", &nodoSeleccionado->collision.size.x, 1.0f, 1.0f, 1000.0f))
+                            nivelActivo->modificado = true;
+                        if (ImGui::DragFloat("Rotation", &nodoSeleccionado->collision.rotation, 1.0f, -360.0f, 360.0f))
+                            nivelActivo->modificado = true;
+                        ImGui::Unindent();
+                    }
+
+                    if (ImGui::Button("Eliminar nodo"))
+                    {
+                        if (nodoSeleccionado->padre)
+                        {
+                            auto& hijos = nodoSeleccionado->padre->hijos;
+                            hijos.erase(std::remove(hijos.begin(), hijos.end(), nodoSeleccionado), hijos.end());
+                            Escena::LiberarNodo(nodoSeleccionado);
+                            nodoSeleccionado = nivelActivo->raiz;
+                            nivelActivo->modificado = true;
+                        }
+                    }
+                    if (ImGui::BeginCombo("Assets", nodoSeleccionado->asset.empty() ? "Ninguno" : nodoSeleccionado->asset.c_str()))
+                    {
+                        if (ImGui::Selectable("Ninguno"))
+                        {
+                            if (nodoSeleccionado->textura)
+                            {
+                                SDL_DestroyTexture(nodoSeleccionado->textura);
+                                nodoSeleccionado->textura = nullptr;
+                            }
+                            nodoSeleccionado->asset = "";
+                            nivelActivo->modificado = true;
+                        }
+                        std::filesystem::path carpetaAssets = std::filesystem::path(rutaProyecto) / "assets";
+                        if (std::filesystem::exists(carpetaAssets))
+                        {
+                            for (const auto& entrada : std::filesystem::directory_iterator(carpetaAssets))
+                            {
+                                std::string nombre = entrada.path().filename().string();
+                                if (ImGui::Selectable(nombre.c_str(), nodoSeleccionado->asset == "assets/" + nombre))
+                                {
+                                    if (nodoSeleccionado->textura)
+                                    {
+                                        SDL_DestroyTexture(nodoSeleccionado->textura);
+                                        nodoSeleccionado->textura = nullptr;
                                     }
+                                    nodoSeleccionado->asset = "assets/" + nombre;
+                                    nivelActivo->modificado = true;
                                 }
-                                if (nivel < (int)stack.size()) stack.resize(nivel);
-                                stack.push_back(nodo);
                             }
                         }
-                        escenas[nombre] = e;
-                        escenasGuardadas.insert(nombre);
-                    }
-                }
-                iniciado = true;
-            }
-
-            if (ImGui::Button("Crear Proyecto")) { showProjectPopup = true; nuevaEscenaNombre[0] = '\0'; }
-            ImGui::SameLine();
-            if (ImGui::Button("Crear Escena")) { showCrearPopup = true; nuevaEscenaNombre[0] = '\0'; }
-            ImGui::SameLine();
-            if (ImGui::Button("Limpiar Escena Activa")) NetejarEscenaActiva();
-            ImGui::SameLine();
-            if (ImGui::Button("Guardar Escena") && activa) DesarEscena(activa->nombre + ".txt");
-
-            if (showCrearPopup) { ImGui::OpenPopup("Crear Nueva Escena"); showCrearPopup = false; }
-            if (ImGui::BeginPopupModal("Crear Nueva Escena", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-                if (ImGui::InputText("Nombre", nuevaEscenaNombre, IM_ARRAYSIZE(nuevaEscenaNombre), ImGuiInputTextFlags_EnterReturnsTrue)
-                    || ImGui::Button("Crear")) {
-                    if (strlen(nuevaEscenaNombre) > 0) {
-                        CrearEscena(nuevaEscenaNombre);
-                        activa = escenas[nuevaEscenaNombre];
-                        seleccionado = activa;
-                        ImGui::CloseCurrentPopup();
-                    }
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("Cancelar")) ImGui::CloseCurrentPopup();
-                ImGui::EndPopup();
-            }
-
-            if (showProjectPopup) { ImGui::OpenPopup("Crear nuevo proyecto"); showProjectPopup = false; }
-            if (ImGui::BeginPopupModal("Crear nuevo proyecto", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-                if (ImGui::InputText("Nombre", nuevoProyectoNombre, IM_ARRAYSIZE(nuevoProyectoNombre), ImGuiInputTextFlags_EnterReturnsTrue)
-                    || ImGui::Button("Crear")) {
-                    if (strlen(nuevoProyectoNombre) > 0) {
-                        //CrearProyecto(nuevoProyectoNombre);
-                        activa = escenas[nuevoProyectoNombre];
-                        seleccionado = activa;
-                        ImGui::CloseCurrentPopup();
-                    }
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("Cancelar")) ImGui::CloseCurrentPopup();
-                ImGui::EndPopup();
-            }
-
-            ImGui::Separator();
-            ImGui::Columns(3, nullptr, true);
-
-            ImGui::BeginChild("SceneTree", ImVec2(0, 300), true);
-            ImGui::Text("Escena activa y nodos:");
-            if (activa) {
-                struct Printer {
-                    Escena*& sel;
-                    std::unordered_map<Escena*, std::vector<char>>& tmpInputs;
-                    Printer(Escena*& s, std::unordered_map<Escena*, std::vector<char>>& i) : sel(s), tmpInputs(i) {}
-                    void run(Escena* e) {
-                        ImGui::PushID((void*)e);
-                        ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_DefaultOpen;
-                        if (sel == e) flags |= ImGuiTreeNodeFlags_Selected;
-                        bool open = ImGui::TreeNodeEx(e->nombre.c_str(), flags);
-                        if (ImGui::IsItemClicked()) sel = e;
-                        ImGui::SameLine();
-                        if (ImGui::Button("+##crear")) {
-                            if (!tmpInputs.count(e))
-                                tmpInputs[e] = std::vector<char>(128, 0);
-                        }
-                        if (tmpInputs.count(e)) {
-                            auto& buf = tmpInputs[e];
-                            ImGui::InputText("##input", buf.data(), buf.size(), ImGuiInputTextFlags_EnterReturnsTrue);
-                            if (ImGui::IsItemDeactivatedAfterEdit()) {
-                                std::string s = buf.data();
-                                if (!s.empty()) {
-                                    Escena* hijo = new Escena();
-                                    hijo->nombre = s;
-                                    hijo->padre = e;
-                                    e->hijos.push_back(hijo);
+                        if (ImGui::Selectable("<Seleccionar imagen>"))
+                        {
+#ifdef _WIN32
+                            std::string origen = SeleccionarImagenWindows();
+#else
+                            std::string origen;
+#endif
+                            if (!origen.empty())
+                            {
+                                std::string destinoRelativo;
+                                if (CopiarAssetAlProyecto(origen, destinoRelativo))
+                                {
+                                    if (nodoSeleccionado->textura)
+                                    {
+                                        SDL_DestroyTexture(nodoSeleccionado->textura);
+                                        nodoSeleccionado->textura = nullptr;
+                                    }
+                                    nodoSeleccionado->asset = destinoRelativo;
+                                    nivelActivo->modificado = true;
                                 }
-                                tmpInputs.erase(e);
                             }
                         }
-                        if (open) {
-                            for (auto* h : e->hijos) run(h);
-                            ImGui::TreePop();
-                        }
-                        ImGui::PopID();
+                        ImGui::EndCombo();
                     }
-                };
-                Printer printer(seleccionado, nuevosNodos);
-                printer.run(activa);
-            }
-            ImGui::EndChild();
-            ImGui::NextColumn();
-
-            ImGui::BeginChild("Centro", ImVec2(0, 300), true);
-            ImGui::Text("Vista de Escena:");
-            ImVec2 panelSize = ImGui::GetContentRegionAvail();
-
-            static SDL_Texture* panelTexture = nullptr;
-            static int panelTextureW = 0;
-            static int panelTextureH = 0;
-            static SDL_Texture* rectTexture = nullptr;
-
-            if (renderer) {
-                if (!panelTexture || panelSize.x != panelTextureW || panelSize.y != panelTextureH) {
-                    if (panelTexture) SDL_DestroyTexture(panelTexture);
-                    panelTexture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET, (int)panelSize.x, (int)panelSize.y);
-                    panelTextureW = (int)panelSize.x;
-                    panelTextureH = (int)panelSize.y;
+                    ImGui::SameLine();
+                    if (ImGui::Button("X"))
+                    {
+                        if (nodoSeleccionado->textura)
+                        {
+                            SDL_DestroyTexture(nodoSeleccionado->textura);
+                            nodoSeleccionado->textura = nullptr;
+                        }
+                        nodoSeleccionado->asset = "";
+                        nivelActivo->modificado = true;
+                    }
                 }
-
-                if (!rectTexture) {
-                    rectTexture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET, 100, 100);
-                    SDL_SetRenderTarget(renderer, rectTexture);
-                    SDL_SetRenderDrawColor(renderer, 200, 100, 100, 255);
-                    SDL_RenderClear(renderer);
-                    SDL_SetRenderTarget(renderer, nullptr);
-                }
-
-                SDL_SetRenderTarget(renderer, panelTexture);
-                SDL_SetRenderDrawColor(renderer, 50, 50, 50, 255);
-                SDL_RenderClear(renderer);
-
-                if (activa) {
-                    SDL_FRect dest = { activa->posicion.x, activa->posicion.y, 100 * activa->escala.x, 100 * activa->escala.y };
-                    SDL_FPoint center = { dest.w * 0.5f, dest.h * 0.5f };
-                    SDL_RenderTextureRotated(renderer, rectTexture, nullptr, &dest, activa->rotacion, &center, SDL_FLIP_NONE);
-                }
-
-                SDL_SetRenderTarget(renderer, nullptr);
-                ImGui::Image((ImTextureID)panelTexture, panelSize);
+                ImGui::EndChild();
+                ImGui::Columns(1);
             }
-
-            ImGui::EndChild();
-
-
-
-
-            ImGui::NextColumn();
-
-            ImGui::BeginChild("Inspector", ImVec2(0, 300), true);
-            ImGui::Text("Inspector del nodo:");
-            if (seleccionado) {
-                ImGui::Text("%s", seleccionado->nombre.c_str());
-                ImGui::DragFloat("Pos X", &seleccionado->posicion.x, 1.0f);
-                ImGui::DragFloat("Pos Y", &seleccionado->posicion.y, 1.0f);
-                ImGui::DragFloat("Rotación", &seleccionado->rotacion, 1.0f);
-                ImGui::DragFloat("Escala X", &seleccionado->escala.x, 0.1f);
-                ImGui::DragFloat("Escala Y", &seleccionado->escala.y, 0.1f);
-            }
-            ImGui::EndChild();
-
-
-
-
-            ImGui::Columns(1);
-            ImGui::Separator();
-
-            ImGui::BeginChild("CarpetaProyecto", ImVec2(0, 300), true);
-            ImGui::Text("Escenas guardadas:");
-            for (auto& nombre : escenasGuardadas) {
-                if (ImGui::Selectable(nombre.c_str(), activa && activa->nombre == nombre)) {
-                    CarregarEscena(nombre + ".txt");
-                    CambiarEscena(nombre);
-                    seleccionado = activa;
+            else
+            {
+                ImGui::BeginChild("GameView", ImVec2(0, 0), true);
+                if (nivelActivo)
+                {
+                    ImVec2 tamano = ImGui::GetContentRegionAvail();
+                    DibujarEscenaEnTextura(renderer, nivelActivo, texturaPanel, anchoTextura, altoTextura, tamano, false);
+                    if (texturaPanel)
+                        ImGui::Image((ImTextureID)texturaPanel, tamano);
                 }
+                ImGui::EndChild();
             }
-            ImGui::EndChild();
             ImGui::End();
         }
-
-
-
-
-
-
-
-        // [ Rendering ]
         ImGui::Render();
-        SDL_SetRenderScale(renderer, io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y);
-        SDL_SetRenderDrawColorFloat(renderer, clear_color.x, clear_color.y, clear_color.z, clear_color.w);
+        SDL_SetRenderDrawColor(renderer, 20, 20, 20, 255);
         SDL_RenderClear(renderer);
-
-        // [ Objects Rendering ]
-
-
-        // [ ImGui Rendering ]
         ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), renderer);
         SDL_RenderPresent(renderer);
+    }
 
-        // [ Delay ]
-        // [If using SDL_MAIN_USE_CALLBACKS: all code below would likely be your SDL_AppIterate() function]
-        if (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED)
-        {
-            SDL_Delay(10);
-            continue;
-        }
+    if (texturaPanel)
+    {
+        SDL_DestroyTexture(texturaPanel);
+        texturaPanel = nullptr;
     }
 }
 
-void Motor::Exit() {
-
+void Motor::Exit()
+{
+    CerrarProyecto();
     ImGui_ImplSDLRenderer3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();
-
-    SDL_DestroyRenderer(renderer);
-    SDL_DestroyWindow(window);
+    if (renderer) SDL_DestroyRenderer(renderer);
+    if (ventana) SDL_DestroyWindow(ventana);
     SDL_Quit();
-}
-
-Motor& Motor::Instance()
-{
-    static Motor instance;
-    return instance;
 }

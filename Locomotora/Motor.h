@@ -1,58 +1,60 @@
 #pragma once
-
 #include <SDL3/SDL.h>
-#include <vector>
-#include <string>
 #include <map>
-#include <unordered_set>
-#include <fstream>
-#include "Vector.h"
+#include <string>
+#include "Escena.h"
 
 namespace Locomotora
 {
-	class Motor {
-	private:
-		float main_scale = 0.0;
-		SDL_Window* window = NULL;
-		SDL_WindowFlags window_flags = NULL;
-		SDL_Renderer* renderer = NULL;
+    class Motor
+    {
+    private:
+        SDL_Window* ventana = nullptr;
+        SDL_Renderer* renderer = nullptr;
+        bool corriendo = false;
+        bool modoJuego = false;
+        bool proyectoAbierto = false;
 
+        std::string rutaProyecto;
+        std::string nombreProyecto;
+        float escalaPantalla = 1.0f;
 
-		bool running = false;
-		std::unordered_set<std::string> escenasGuardadas;
+        std::map<std::string, Escena*> niveles;
+        Escena* nivelActivo = nullptr;
 
-		class Proyecto {
-			public:
-			std::string nombre;
-			std::string ruta;
-			Proyecto(const std::string& n, const std::string& r) : nombre(n), ruta(r) {};
-		};
+        Nodo* nodoSeleccionado = nullptr;
+        SDL_Texture* texturaPanel = nullptr;
+        int anchoTextura = 0, altoTextura = 0;
+        std::string rutaArchivoSeleccionado;
+        std::string nombreAccionPendiente;
+        enum class AccionPendiente { Ninguna, CrearNivel, CambiarNivel };
+        AccionPendiente accionPendiente = AccionPendiente::Ninguna;
+        bool errorNombreDuplicado = false;
+        bool popupEliminarNivel = false;
+        std::string nivelAEliminar;
+        bool popupEliminarArchivo = false;
+        std::string archivoAEliminar;
+        char bufferNivel[128] = "";
+        char bufferNombreNodo[128] = "";
 
-		class Escena {
-		public:
-			std::string nombre;
-			std::vector<std::string> objects;
-			std::vector<Escena*> hijos;
-			Escena* padre = nullptr;
-			Punt posicion;
-			float rotacion;
-			Vector escala;
-			Escena() : posicion{ 0,0 }, rotacion{ 0.0 }, escala{ 1,1 } {};
-			void netejar() { objects.clear(); hijos.clear(); };
-		};
-		std::map<std::string, Escena*> escenas;
-		Escena* activa = nullptr;
-	public:
-		static Motor& Instance();
-		int Init();
-		void Run();
-		void Exit();
-		void CrearEscena(const std::string& nom);
-		void CambiarEscena(const std::string& nom);
-		void NetejarEscenaActiva();
-		void DesarEscena(const std::string& fitxer);
-		void CarregarEscena(const std::string& fitxer);
-		/*void CrearProyecto(const std::string& nom, const std::string& rute);
-		void CarregarProyecto(const std::string& rute);*/
-	};
+        void liberar();
+        std::string RutaNivel(const std::string& nombre) const;
+        bool CopiarAssetAlProyecto(const std::string& origen, std::string& destinoRelativo) const;
+        void EliminarEscena(const std::string& nombre);
+
+    public:
+        static Motor& Instance();
+
+        int Init();
+        void Run();
+        void Exit();
+
+        bool CrearProyecto(const std::string& ruta);
+        bool AbrirProyecto(const std::string& ruta);
+        void CerrarProyecto();
+
+        void CrearEscena(const std::string& nombre);
+        void CambiarEscena(const std::string& nombre);
+        void GuardarEscenaActual();
+    };
 }
