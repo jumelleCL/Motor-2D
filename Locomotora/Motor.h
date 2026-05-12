@@ -37,8 +37,6 @@ namespace Locomotora
         char bufferNivel[128] = "";
         char bufferNombreNodo[128] = "";
 
-        void liberar();
-        std::string RutaNivel(const std::string& nombre) const;
         bool CopiarAssetAlProyecto(const std::string& origen, std::string& destinoRelativo) const;
         void EliminarEscena(const std::string& nombre);
 
@@ -51,8 +49,6 @@ namespace Locomotora
 
         bool CrearProyecto(const std::string& ruta);
         bool AbrirProyecto(const std::string& ruta);
-        void CerrarProyecto();
-
         void CrearEscena(const std::string& nombre);
         void CambiarEscena(const std::string& nombre);
         void GuardarEscenaActual();

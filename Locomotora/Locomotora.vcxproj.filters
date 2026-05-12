@@ -318,6 +318,9 @@
     <ClInclude Include="Escena.h">
       <Filter>Archivos de encabezado</Filter>
     </ClInclude>
+    <ClInclude Include="libs\sdl3\include\SDL3\SDL_image.h">
+      <Filter>Archivos de encabezado\sdl3</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp">

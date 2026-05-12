@@ -1,516 +1,438 @@
 #include "Escena.h"
 #include <fstream>
-#include <sstream>
-#include <iomanip>
 #include <filesystem>
-#include <vector>
 #include <functional>
-#include <cstring>
-#include <cctype>
-
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#include <wincodec.h>
-#pragma comment(lib, "ole32.lib")
-#pragma comment(lib, "uuid.lib")
-#pragma comment(lib, "windowscodecs.lib")
-#endif
+#include <SDL3/SDL_image.h>
+#include <sstream>
+#include <cmath>
 
 using namespace Locomotora;
 
-void Escena::LiberarNodo(Nodo* nodo)
-{
-    if (!nodo) return;
-    for (auto* hijo : nodo->hijos)
-        LiberarNodo(hijo);
-    if (nodo->textura)
-        SDL_DestroyTexture(nodo->textura);
-    delete nodo;
+static SDL_Texture* CargarTextura(SDL_Renderer* r, const std::string& path) {
+    SDL_Texture* tex = IMG_LoadTexture(r, path.c_str());
+    if (tex) {
+        SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
+        SDL_SetTextureScaleMode(tex, SDL_SCALEMODE_LINEAR);
+    }
+    return tex;
 }
 
-static void LiberarHijos(Nodo* nodo)
-{
-    if (!nodo) return;
-    for (auto* hijo : nodo->hijos)
-        Escena::LiberarNodo(hijo);
-    nodo->hijos.clear();
+static SDL_Texture* ObtenerTexturaColor(SDL_Renderer* r, Uint8 color[4]) {
+    static SDL_Texture* texGris = nullptr;
+    static SDL_Texture* texRojo = nullptr;
+    SDL_Texture*& tex = (color[0] == 200) ? texGris : texRojo;
+    if (!tex) {
+        tex = SDL_CreateTexture(r, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET, 1, 1);
+        if (tex) {
+            SDL_SetRenderTarget(r, tex);
+            SDL_SetRenderDrawColor(r, color[0], color[1], color[2], color[3]);
+            SDL_RenderClear(r);
+            SDL_SetRenderTarget(r, nullptr);
+            SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
+        }
+    }
+    return tex;
 }
 
-static bool RectangulosColisionan(const SDL_FRect& a, const SDL_FRect& b)
-{
-    return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
-}
-
-static Punt PosicionMundial(const Nodo* nodo)
-{
-    Punt pos = nodo->posicion;
-    const Nodo* actual = nodo->padre;
-    while (actual)
-    {
-        pos.x += actual->posicion.x;
-        pos.y += actual->posicion.y;
-        actual = actual->padre;
+static Punt PosicionMundial(const Nodo* n) {
+    Punt pos = n->posicion;
+    for (auto* p = n->padre; p; p = p->padre) {
+        pos.x += p->posicion.x;
+        pos.y += p->posicion.y;
     }
     return pos;
 }
 
-static Vector EscalaMundial(const Nodo* nodo)
-{
-    Vector esc = nodo->escala;
-    const Nodo* actual = nodo->padre;
-    while (actual)
-    {
-        esc.x *= actual->escala.x;
-        esc.y *= actual->escala.y;
-        actual = actual->padre;
+static Vector EscalaMundial(const Nodo* n) {
+    Vector esc = n->escala;
+    for (auto* p = n->padre; p; p = p->padre) {
+        esc.x *= p->escala.x;
+        esc.y *= p->escala.y;
     }
     return esc;
 }
 
-static SDL_FRect RectanguloMundial(const Nodo* nodo)
-{
-    Punt pos = PosicionMundial(nodo);
-    Vector esc = EscalaMundial(nodo);
-    return SDL_FRect{ pos.x, pos.y, nodo->size.x * esc.x, nodo->size.y * esc.y };
+static float RotacionMundial(const Nodo* n) {
+    float rot = n->rotacion;
+    for (auto* p = n->padre; p; p = p->padre)
+        rot += p->rotacion;
+    return rot;
 }
 
-static SDL_FRect RectanguloColisionMundial(const Nodo* nodo)
-{
-    if (!nodo->collision.enabled) return SDL_FRect{ 0,0,0,0 };
-    Punt pos = PosicionMundial(nodo);
-    pos.x += nodo->collision.offset.x;
-    pos.y += nodo->collision.offset.y;
-    Vector esc = EscalaMundial(nodo);
-    return SDL_FRect{ pos.x, pos.y, nodo->collision.size.x * esc.x, nodo->collision.size.y * esc.y };
+static SDL_FRect RectanguloMundial(const Nodo* n) {
+    Punt pos = PosicionMundial(n);
+    Vector esc = EscalaMundial(n);
+    return { pos.x, pos.y, n->size.x * esc.x, n->size.y * esc.y };
 }
 
-static Nodo* BuscarColliderPropio(Nodo* nodo)
-{
-    if (!nodo) return nullptr;
-    if (nodo->collision.enabled) return nodo;
-    for (auto* hijo : nodo->hijos)
-        if (Nodo* collider = BuscarColliderPropio(hijo))
-            return collider;
+static SDL_FRect ColisionMundial(const Nodo* n) {
+    if (!n->collision.enabled) return { 0,0,0,0 };
+    SDL_FRect rect = RectanguloMundial(n);
+    rect.x += n->collision.offset.x;
+    rect.y += n->collision.offset.y;
+    rect.w = n->collision.size.x * (rect.w / n->size.x);
+    rect.h = n->collision.size.y * (rect.h / n->size.y);
+    return rect;
+}
+
+struct Vec2 { float x, y; };
+struct OBB {
+    Vec2 center;
+    Vec2 half;
+    float angle;
+};
+
+static OBB ObtenerOBB(const Nodo* n) {
+    SDL_FRect r = ColisionMundial(n);
+    OBB obb;
+    obb.center.x = r.x + r.w * 0.5f;
+    obb.center.y = r.y + r.h * 0.5f;
+    obb.half.x = r.w * 0.5f;
+    obb.half.y = r.h * 0.5f;
+    obb.angle = RotacionMundial(n) + n->collision.rotation;
+    return obb;
+}
+
+static void ProyectarOBB(const OBB& obb, const Vec2& axis, float& min, float& max) {
+    float rad = obb.angle * 3.14159265358979f / 180.0f;
+    float cosA = cosf(rad), sinA = sinf(rad);
+    Vec2 ux = { cosA, sinA };
+    Vec2 uy = { -sinA, cosA };
+    Vec2 vertices[4] = {
+        { -obb.half.x, -obb.half.y }, {  obb.half.x, -obb.half.y },
+        {  obb.half.x,  obb.half.y }, { -obb.half.x,  obb.half.y }
+    };
+    min = INFINITY; max = -INFINITY;
+    for (int i = 0; i < 4; ++i) {
+        float vx = vertices[i].x * ux.x - vertices[i].y * uy.x + obb.center.x;
+        float vy = vertices[i].x * ux.y - vertices[i].y * uy.y + obb.center.y;
+        float proy = vx * axis.x + vy * axis.y;
+        if (proy < min) min = proy;
+        if (proy > max) max = proy;
+    }
+}
+
+static bool ColisionOBB(const OBB& a, const OBB& b) {
+    float radA = a.angle * 3.14159265358979f / 180.0f;
+    float radB = b.angle * 3.14159265358979f / 180.0f;
+    Vec2 axes[4] = {
+        { cosf(radA), sinf(radA) }, { -sinf(radA), cosf(radA) },
+        { cosf(radB), sinf(radB) }, { -sinf(radB), cosf(radB) }
+    };
+    for (int i = 0; i < 4; ++i) {
+        float minA, maxA, minB, maxB;
+        ProyectarOBB(a, axes[i], minA, maxA);
+        ProyectarOBB(b, axes[i], minB, maxB);
+        if (maxA < minB || maxB < minA) return false;
+    }
+    return true;
+}
+
+static bool EsDescendiente(const Nodo* hijo, const Nodo* padre) {
+    while (hijo) {
+        if (hijo == padre) return true;
+        hijo = hijo->padre;
+    }
+    return false;
+}
+
+static Nodo* BuscarColliderPropio(Nodo* n) {
+    if (!n) return nullptr;
+    if (n->collision.enabled) return n;
+    for (auto* h : n->hijos)
+        if (auto* c = BuscarColliderPropio(h)) return c;
     return nullptr;
 }
 
-static void RecolectarNodosMovilesYColisionadores(Nodo* nodo, std::vector<Nodo*>& moviles, std::vector<Nodo*>& colisionadores)
-{
+Escena::Escena() { raiz = new Nodo(); raiz->nombre = "Nivel"; }
+Escena::~Escena() { LiberarNodo(raiz); }
+
+void Escena::LiberarNodo(Nodo* nodo) {
     if (!nodo) return;
-    if (nodo->movement) moviles.push_back(nodo);
-    if (nodo->collision.enabled) colisionadores.push_back(nodo);
-    for (auto* hijo : nodo->hijos)
-        RecolectarNodosMovilesYColisionadores(hijo, moviles, colisionadores);
+    for (auto* h : nodo->hijos) LiberarNodo(h);
+    if (nodo->textura) SDL_DestroyTexture(nodo->textura);
+    delete nodo;
 }
 
-static bool EsDescendiente(const Nodo* posibleHijo, const Nodo* posibleAncestro)
-{
-    const Nodo* actual = posibleHijo;
-    while (actual)
-    {
-        if (actual == posibleAncestro) return true;
-        actual = actual->padre;
-    }
-    return false;
-}
-
-#ifdef _WIN32
-static std::wstring Utf8ToWide(const std::string& texto)
-{
-    if (texto.empty()) return {};
-    int size = MultiByteToWideChar(CP_UTF8, 0, texto.c_str(), -1, nullptr, 0);
-    std::wstring wide(size - 1, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, texto.c_str(), -1, wide.data(), size);
-    return wide;
-}
-
-static SDL_Texture* CargarTexturaImagen(SDL_Renderer* renderer, const std::string& ruta)
-{
-    SDL_Texture* textura = nullptr;
-    IWICImagingFactory* fabrica = nullptr;
-    IWICBitmapDecoder* decodificador = nullptr;
-    IWICBitmapFrameDecode* frame = nullptr;
-    IWICFormatConverter* convertidor = nullptr;
-    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    bool coInicializado = SUCCEEDED(hr);
-    hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&fabrica));
-    if (SUCCEEDED(hr))
-    {
-        std::wstring wpath = Utf8ToWide(ruta);
-        hr = fabrica->CreateDecoderFromFilename(wpath.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad, &decodificador);
-        if (SUCCEEDED(hr)) hr = decodificador->GetFrame(0, &frame);
-        if (SUCCEEDED(hr)) hr = fabrica->CreateFormatConverter(&convertidor);
-        if (SUCCEEDED(hr)) hr = convertidor->Initialize(frame, GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeMedianCut);
-        if (SUCCEEDED(hr))
-        {
-            UINT ancho = 0, alto = 0;
-            frame->GetSize(&ancho, &alto);
-            std::vector<unsigned char> pixeles((size_t)ancho * (size_t)alto * 4);
-            hr = convertidor->CopyPixels(nullptr, ancho * 4, (UINT)pixeles.size(), pixeles.data());
-            if (SUCCEEDED(hr))
-            {
-                textura = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_BGRA8888, SDL_TEXTUREACCESS_STATIC, (int)ancho, (int)alto);
-                if (textura)
-                {
-                    SDL_UpdateTexture(textura, nullptr, pixeles.data(), (int)(ancho * 4));
-                    SDL_SetTextureScaleMode(textura, SDL_SCALEMODE_LINEAR);
-                    SDL_SetTextureBlendMode(textura, SDL_BLENDMODE_BLEND);
-                }
-            }
-        }
-    }
-    if (convertidor) convertidor->Release();
-    if (frame) frame->Release();
-    if (decodificador) decodificador->Release();
-    if (fabrica) fabrica->Release();
-    if (coInicializado) CoUninitialize();
-    if (!textura)
-    {
-        SDL_Surface* superficie = SDL_LoadBMP(ruta.c_str());
-        if (superficie)
-        {
-            textura = SDL_CreateTextureFromSurface(renderer, superficie);
-            if (textura) SDL_SetTextureBlendMode(textura, SDL_BLENDMODE_BLEND);
-            SDL_DestroySurface(superficie);
-        }
-    }
-    if (!textura)
-        SDL_Log("Error cargando textura: %s", ruta.c_str());
-    return textura;
-}
-#else
-static SDL_Texture* CargarTexturaImagen(SDL_Renderer* renderer, const std::string& ruta)
-{
-    SDL_Surface* superficie = SDL_LoadBMP(ruta.c_str());
-    if (!superficie) return nullptr;
-    SDL_Texture* textura = SDL_CreateTextureFromSurface(renderer, superficie);
-    if (textura) SDL_SetTextureBlendMode(textura, SDL_BLENDMODE_BLEND);
-    SDL_DestroySurface(superficie);
-    return textura;
-}
-#endif
-
-Escena::Escena()
-{
-    raiz = new Nodo();
-    raiz->nombre = "Nivel";
-    raiz->padre = nullptr;
-}
-
-Escena::~Escena()
-{
-    if (raiz)
-        LiberarNodo(raiz);
-}
-
-Nodo* Escena::CrearNodo(Nodo* padre, const std::string& nombre)
-{
+Nodo* Escena::CrearNodo(Nodo* padre, const std::string& nombre) {
     if (!padre) padre = raiz;
-    Nodo* nuevo = new Nodo();
-    nuevo->nombre = nombre;
-    nuevo->padre = padre;
-    padre->hijos.push_back(nuevo);
+    auto* n = new Nodo();
+    n->nombre = nombre;
+    n->padre = padre;
+    padre->hijos.push_back(n);
     modificado = true;
-    return nuevo;
+    return n;
 }
 
-void Escena::netejar()
-{
-    if (raiz)
-        LiberarHijos(raiz);
+void Escena::netejar() {
+    while (!raiz->hijos.empty()) {
+        Nodo* hijo = raiz->hijos.back();
+        raiz->hijos.pop_back();
+        LiberarNodo(hijo);
+    }
 }
 
-void Escena::Update(float deltaTime, const bool* teclas)
-{
+void Escena::Update(float dt, const bool* teclas) {
     if (!raiz || !teclas) return;
-    std::vector<Nodo*> nodosMoviles, nodosColisionadores;
-    RecolectarNodosMovilesYColisionadores(raiz, nodosMoviles, nodosColisionadores);
 
-    auto Colisiona = [&](Nodo* mover, Nodo* hitbox)
-        {
-            SDL_FRect rectMover = RectanguloColisionMundial(hitbox);
-            for (auto* colisionador : nodosColisionadores)
-            {
-                if (colisionador == hitbox) continue;
-                if (EsDescendiente(colisionador, mover)) continue;
-                SDL_FRect rectCol = RectanguloColisionMundial(colisionador);
-                if (RectangulosColisionan(rectMover, rectCol)) return true;
-            }
-            return false;
+    std::vector<Nodo*> moviles, colisores;
+    std::function<void(Nodo*)> recolectar = [&](Nodo* n) {
+        if (!n) return;
+        if (n->movement) moviles.push_back(n);
+        if (n->collision.enabled) colisores.push_back(n);
+        for (auto* h : n->hijos) recolectar(h);
         };
+    recolectar(raiz);
 
-    for (auto* mover : nodosMoviles)
-    {
-        Nodo* hitbox = BuscarColliderPropio(mover);
+    for (auto* mover : moviles) {
+        auto* hitbox = BuscarColliderPropio(mover);
         if (!hitbox) hitbox = mover;
 
-        float desplazamientoX = 0.0f, desplazamientoY = 0.0f;
-        float paso = mover->speed * deltaTime;
+        float dx = 0, dy = 0, paso = mover->speed * dt;
+        if (teclas[SDL_SCANCODE_W] || teclas[SDL_SCANCODE_UP])   dy -= paso;
+        if (teclas[SDL_SCANCODE_S] || teclas[SDL_SCANCODE_DOWN]) dy += paso;
+        if (teclas[SDL_SCANCODE_A] || teclas[SDL_SCANCODE_LEFT]) dx -= paso;
+        if (teclas[SDL_SCANCODE_D] || teclas[SDL_SCANCODE_RIGHT])dx += paso;
 
-        if (teclas[SDL_SCANCODE_W] || teclas[SDL_SCANCODE_UP]) desplazamientoY -= paso;
-        if (teclas[SDL_SCANCODE_S] || teclas[SDL_SCANCODE_DOWN]) desplazamientoY += paso;
-        if (teclas[SDL_SCANCODE_A] || teclas[SDL_SCANCODE_LEFT]) desplazamientoX -= paso;
-        if (teclas[SDL_SCANCODE_D] || teclas[SDL_SCANCODE_RIGHT]) desplazamientoX += paso;
-
-        if (desplazamientoX != 0.0f)
-        {
-            mover->posicion.x += desplazamientoX;
-            if (Colisiona(mover, hitbox))
-                mover->posicion.x -= desplazamientoX;
-            else
-                modificado = true;
-        }
-        if (desplazamientoY != 0.0f)
-        {
-            mover->posicion.y += desplazamientoY;
-            if (Colisiona(mover, hitbox))
-                mover->posicion.y -= desplazamientoY;
-            else
-                modificado = true;
-        }
-    }
-}
-
-static void DibujarNodo(SDL_Renderer* renderer, Nodo* nodo, bool modoEditor, const std::filesystem::path& rutaBase)
-{
-    if (!nodo) return;
-    if (!nodo->visible && !modoEditor) return;
-
-    SDL_FRect rect = RectanguloMundial(nodo);
-
-    if (!nodo->textura && !nodo->asset.empty())
-    {
-        std::string rutaCompleta = (rutaBase / nodo->asset).string();
-        nodo->textura = CargarTexturaImagen(renderer, rutaCompleta);
-    }
-
-    if (nodo->textura)
-    {
-        SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
-        SDL_RenderTextureRotated(renderer, nodo->textura, nullptr, &rect, nodo->rotacion, nullptr, SDL_FLIP_NONE);
-    }
-    else
-    {
-        SDL_SetRenderDrawColor(renderer, 200, 200, 200, 255);
-        SDL_RenderFillRect(renderer, &rect);
-    }
-
-    for (auto* hijo : nodo->hijos)
-        DibujarNodo(renderer, hijo, modoEditor, rutaBase);
-
-    if (modoEditor && nodo->collision.enabled)
-    {
-        SDL_FRect rectColision = RectanguloColisionMundial(nodo);
-        SDL_SetRenderDrawColor(renderer, 255, 50, 50, 255);
-        SDL_RenderRect(renderer, &rectColision);
-    }
-}
-
-void Escena::Render(SDL_Renderer* renderer, bool modoEditor)
-{
-    if (!raiz) return;
-    std::filesystem::path base = rutaBase.empty() ? std::filesystem::path() : std::filesystem::path(rutaBase);
-    for (auto* hijo : raiz->hijos)
-        DibujarNodo(renderer, hijo, modoEditor, base);
-}
-
-void Escena::Guardar(const std::string& ruta) const
-{
-    std::ofstream archivo(ruta);
-    if (!archivo.is_open()) return;
-    std::function<void(const Nodo*, std::ostream&)> escribirNodo;
-    escribirNodo = [&](const Nodo* nodo, std::ostream& os)
-        {
-            os << "{";
-            os << "\"nombre\":\"" << nodo->nombre << "\",";
-            os << "\"pos\":[" << nodo->posicion.x << "," << nodo->posicion.y << "],";
-            os << "\"escala\":[" << nodo->escala.x << "," << nodo->escala.y << "],";
-            os << "\"rot\":" << nodo->rotacion << ",";
-            os << "\"collision_enabled\":" << (nodo->collision.enabled ? "true" : "false") << ",";
-            os << "\"collision_offset\":[" << nodo->collision.offset.x << "," << nodo->collision.offset.y << "],";
-            os << "\"collision_size\":[" << nodo->collision.size.x << "," << nodo->collision.size.y << "],";
-            os << "\"collision_rot\":" << nodo->collision.rotation << ",";
-            os << "\"movement\":" << (nodo->movement ? "true" : "false") << ",";
-            os << "\"visible\":" << (nodo->visible ? "true" : "false") << ",";
-            os << "\"speed\":" << nodo->speed << ",";
-            os << "\"asset\":\"" << nodo->asset << "\",";
-            os << "\"hijos\":[";
-            for (size_t i = 0; i < nodo->hijos.size(); ++i)
-            {
-                escribirNodo(nodo->hijos[i], os);
-                if (i < nodo->hijos.size() - 1) os << ",";
+        auto test = [&](float ox, float oy) -> bool {
+            mover->posicion.x += ox;
+            mover->posicion.y += oy;
+            OBB moverOBB = ObtenerOBB(hitbox);
+            for (auto* otro : colisores) {
+                if (otro == hitbox) continue;
+                if (EsDescendiente(otro, mover)) continue;
+                if (ColisionOBB(moverOBB, ObtenerOBB(otro))) {
+                    mover->posicion.x -= ox;
+                    mover->posicion.y -= oy;
+                    return true;
+                }
             }
-            os << "]";
-            os << "}";
-        };
-    archivo << "{\"nombre\":\"" << nombre << "\",\"raiz\":{";
-    archivo << "\"hijos\":[";
-    for (size_t i = 0; i < raiz->hijos.size(); ++i)
-    {
-        escribirNodo(raiz->hijos[i], archivo);
-        if (i < raiz->hijos.size() - 1) archivo << ",";
+            modificado = true;
+            return false;
+            };
+
+        if (dx != 0) test(dx, 0);
+        if (dy != 0) test(0, dy);
     }
-    archivo << "]}}";
 }
 
-static std::string ExtraerString(const std::string& texto, size_t inicio, size_t& fin)
-{
-    size_t a = texto.find('"', inicio);
-    if (a == std::string::npos) return "";
-    size_t b = texto.find('"', a + 1);
-    if (b == std::string::npos) return "";
-    fin = b + 1;
-    return texto.substr(a + 1, b - a - 1);
+static void DibujarNodo(SDL_Renderer* r, Nodo* n, bool editor, const std::filesystem::path& base) {
+    if (!n || (!n->visible && !editor)) return;
+    SDL_FRect rect = RectanguloMundial(n);
+
+    if (!n->textura && !n->asset.empty()) {
+        std::string fullPath = (base / n->asset).string();
+        n->textura = CargarTextura(r, fullPath);
+    }
+
+    if (n->textura) {
+        SDL_RenderTextureRotated(r, n->textura, nullptr, &rect, n->rotacion, nullptr, SDL_FLIP_NONE);
+    }
+    else {
+        Uint8 gris[4] = { 200,200,200,255 };
+        SDL_Texture* tex = ObtenerTexturaColor(r, gris);
+        if (tex) SDL_RenderTextureRotated(r, tex, nullptr, &rect, n->rotacion, nullptr, SDL_FLIP_NONE);
+        else {
+            SDL_SetRenderDrawColor(r, 200, 200, 200, 255);
+            SDL_RenderFillRect(r, &rect);
+        }
+    }
+
+    for (auto* h : n->hijos) DibujarNodo(r, h, editor, base);
+
+    if (editor && n->collision.enabled) {
+        SDL_FRect col = ColisionMundial(n);
+        float rot = RotacionMundial(n) + n->collision.rotation;
+        float cx = col.x + col.w / 2, cy = col.y + col.h / 2;
+        float sinR = sinf(rot * 3.14159265359f / 180.0f);
+        float cosR = cosf(rot * 3.14159265359f / 180.0f);
+        float hw = col.w / 2, hh = col.h / 2;
+        SDL_FPoint pts[4] = {
+            { -hw, -hh }, {  hw, -hh }, {  hw,  hh }, { -hw,  hh }
+        };
+        for (int i = 0; i < 4; ++i) {
+            float x = pts[i].x * cosR - pts[i].y * sinR + cx;
+            float y = pts[i].x * sinR + pts[i].y * cosR + cy;
+            pts[i].x = x; pts[i].y = y;
+        }
+        SDL_SetRenderDrawColor(r, 255, 50, 50, 255);
+        for (int i = 0; i < 4; ++i)
+            SDL_RenderLine(r, pts[i].x, pts[i].y, pts[(i + 1) % 4].x, pts[(i + 1) % 4].y);
+    }
 }
 
-static float ExtraerNumero(const std::string& texto, size_t inicio, size_t& fin)
-{
-    size_t a = inicio;
-    while (a < texto.size() && (texto[a] == ' ' || texto[a] == '\t' || texto[a] == ':' || texto[a] == ','))
-        a++;
-    size_t b = a;
-    while (b < texto.size() && (isdigit(texto[b]) || texto[b] == '.' || texto[b] == '-'))
-        b++;
-    if (b == a) { fin = a; return 0.0f; }
-    fin = b;
-    return std::stof(texto.substr(a, b - a));
+void Escena::Render(SDL_Renderer* renderer, bool modoEditor) {
+    if (!raiz) return;
+    for (auto* h : raiz->hijos)
+        DibujarNodo(renderer, h, modoEditor, rutaBase);
+}
+void Escena::Guardar(const std::string& ruta) const {
+    std::ofstream f(ruta);
+    if (!f) return;
+    f << "escena=" << nombre << "\n";
+    f << "rutaBase=" << rutaBase << "\n";
+    f << "nodos=[";
+    for (size_t i = 0; i < raiz->hijos.size(); ++i) {
+        std::function<void(const Nodo*)> escribir = [&](const Nodo* n) {
+            f << "{";
+            f << "nombre=" << n->nombre << ";";
+            f << "pos=" << n->posicion.x << "," << n->posicion.y << ";";
+            f << "escala=" << n->escala.x << "," << n->escala.y << ";";
+            f << "size=" << n->size.x << "," << n->size.y << ";";
+            f << "rot=" << n->rotacion << ";";
+            f << "visible=" << (n->visible ? "1" : "0") << ";";
+            f << "movement=" << (n->movement ? "1" : "0") << ";";
+            f << "speed=" << n->speed << ";";
+            f << "asset=" << n->asset << ";";
+            f << "collision_enabled=" << (n->collision.enabled ? "1" : "0") << ";";
+            f << "collision_offset=" << n->collision.offset.x << "," << n->collision.offset.y << ";";
+            f << "collision_size=" << n->collision.size.x << "," << n->collision.size.y << ";";
+            f << "collision_rot=" << n->collision.rotation << ";";
+            f << "hijos=[";
+            for (size_t j = 0; j < n->hijos.size(); ++j) {
+                escribir(n->hijos[j]);
+                if (j < n->hijos.size() - 1) f << ",";
+            }
+            f << "]}";
+            };
+        escribir(raiz->hijos[i]);
+        if (i < raiz->hijos.size() - 1) f << ",";
+    }
+    f << "]\n";
 }
 
-static bool ExtraerBooleano(const std::string& texto, size_t inicio, size_t& fin)
-{
-    size_t a = inicio;
-    while (a < texto.size() && (texto[a] == ' ' || texto[a] == '\t' || texto[a] == ':' || texto[a] == ','))
-        a++;
-    if (texto.compare(a, 4, "true") == 0) { fin = a + 4; return true; }
-    if (texto.compare(a, 5, "false") == 0) { fin = a + 5; return false; }
-    fin = a;
-    return false;
-}
+bool Escena::Cargar(const std::string& ruta) {
+    std::ifstream f(ruta);
+    if (!f) return false;
+    netejar();
 
-static void ExtraerArray2(const std::string& texto, size_t inicio, float& x, float& y, size_t& fin)
-{
-    size_t a = texto.find('[', inicio);
-    if (a == std::string::npos) { fin = inicio; return; }
-    size_t b = texto.find(',', a + 1);
-    if (b == std::string::npos) { fin = a + 1; return; }
-    x = std::stof(texto.substr(a + 1, b - a - 1));
-    size_t c = texto.find(']', b + 1);
-    if (c == std::string::npos) { fin = b + 1; return; }
-    y = std::stof(texto.substr(b + 1, c - b - 1));
-    fin = c + 1;
-}
+    std::stringstream buffer;
+    buffer << f.rdbuf();
+    std::string contenido = buffer.str();
 
-static Nodo* ParsearNodo(const std::string& textoNodo, size_t& pos, Nodo* padre)
-{
-    if (pos >= textoNodo.size() || textoNodo[pos] != '{')
-        return nullptr;
-    pos++;
-    Nodo* nodo = new Nodo();
-    nodo->padre = padre;
-    while (pos < textoNodo.size() && textoNodo[pos] != '}')
-    {
-        while (pos < textoNodo.size() && (textoNodo[pos] == ' ' || textoNodo[pos] == '\t' || textoNodo[pos] == ','))
-            pos++;
-        if (textoNodo[pos] == '"')
-        {
-            size_t finClave;
-            std::string clave = ExtraerString(textoNodo, pos, finClave);
-            pos = finClave;
-            while (pos < textoNodo.size() && (textoNodo[pos] == ' ' || textoNodo[pos] == ':' || textoNodo[pos] == '\t'))
-                pos++;
-            if (clave == "nombre")
-                nodo->nombre = ExtraerString(textoNodo, pos, pos);
-            else if (clave == "asset")
-                nodo->asset = ExtraerString(textoNodo, pos, pos);
-            else if (clave == "collision_enabled")
-                nodo->collision.enabled = ExtraerBooleano(textoNodo, pos, pos);
-            else if (clave == "collision_offset")
-                ExtraerArray2(textoNodo, pos, nodo->collision.offset.x, nodo->collision.offset.y, pos);
-            else if (clave == "collision_size")
-                ExtraerArray2(textoNodo, pos, nodo->collision.size.x, nodo->collision.size.y, pos);
-            else if (clave == "collision_rot")
-                nodo->collision.rotation = ExtraerNumero(textoNodo, pos, pos);
-            else if (clave == "movement")
-                nodo->movement = ExtraerBooleano(textoNodo, pos, pos);
-            else if (clave == "visible")
-                nodo->visible = ExtraerBooleano(textoNodo, pos, pos);
-            else if (clave == "speed")
-                nodo->speed = ExtraerNumero(textoNodo, pos, pos);
-            else if (clave == "rot")
-                nodo->rotacion = ExtraerNumero(textoNodo, pos, pos);
-            else if (clave == "pos")
-                ExtraerArray2(textoNodo, pos, nodo->posicion.x, nodo->posicion.y, pos);
-            else if (clave == "escala")
-                ExtraerArray2(textoNodo, pos, nodo->escala.x, nodo->escala.y, pos);
-            else if (clave == "hijos")
-            {
-                size_t inicioArray = textoNodo.find('[', pos);
-                if (inicioArray != std::string::npos)
-                {
-                    size_t arrPos = inicioArray + 1;
-                    while (arrPos < textoNodo.size() && textoNodo[arrPos] != ']')
-                    {
-                        while (arrPos < textoNodo.size() && (textoNodo[arrPos] == ' ' || textoNodo[arrPos] == ',' || textoNodo[arrPos] == '\n'))
-                            arrPos++;
-                        if (textoNodo[arrPos] == '{')
-                        {
-                            Nodo* hijo = ParsearNodo(textoNodo, arrPos, nodo);
+    size_t p = contenido.find("escena=");
+    if (p != std::string::npos) {
+        p += 7;
+        size_t end = contenido.find('\n', p);
+        nombre = contenido.substr(p, end - p);
+    }
+    p = contenido.find("rutaBase=");
+    if (p != std::string::npos) {
+        p += 9;
+        size_t end = contenido.find('\n', p);
+        rutaBase = contenido.substr(p, end - p);
+    }
+
+    p = contenido.find("nodos=[");
+    if (p == std::string::npos) return false;
+    p += 7;
+    size_t end = contenido.find_last_of(']');
+    if (end == std::string::npos) return false;
+    std::string nodosStr = contenido.substr(p, end - p);
+
+    std::function<Nodo* (const std::string&, size_t&, Nodo*)> leerNodo =
+        [&](const std::string& str, size_t& i, Nodo* padre) -> Nodo* {
+        while (i < str.size() && isspace(str[i])) i++;
+        if (i >= str.size() || str[i] != '{') return nullptr;
+        i++;
+
+        Nodo* nodo = new Nodo();
+        nodo->padre = padre;
+
+        while (i < str.size()) {
+            while (i < str.size() && isspace(str[i])) i++;
+            if (i >= str.size()) break;
+            if (str[i] == '}') { i++; break; }
+
+            std::string clave;
+            while (i < str.size() && str[i] != '=' && str[i] != '}') {
+                clave += str[i];
+                i++;
+            }
+            if (str[i] == '}') { i++; break; }
+            i++;
+
+            std::string valor;
+            if (clave == "hijos") {
+                if (i < str.size() && str[i] == '[') {
+                    int nivel = 1;
+                    valor += '[';
+                    i++;
+                    while (i < str.size() && nivel > 0) {
+                        if (str[i] == '[') nivel++;
+                        else if (str[i] == ']') nivel--;
+                        valor += str[i];
+                        i++;
+                    }
+                }
+            }
+            else {
+                while (i < str.size() && str[i] != ';') {
+                    valor += str[i];
+                    i++;
+                }
+                i++;
+            }
+
+            auto trim = [](std::string& s) {
+                size_t a = s.find_first_not_of(" \t\r\n");
+                if (a == std::string::npos) s.clear();
+                else s = s.substr(a);
+                size_t b = s.find_last_not_of(" \t\r\n");
+                if (b != std::string::npos) s = s.substr(0, b + 1);
+                };
+            trim(clave);
+            trim(valor);
+
+            if (clave == "nombre") nodo->nombre = valor;
+            else if (clave == "asset") nodo->asset = valor;
+            else if (clave == "visible") nodo->visible = (valor == "1" || valor == "true");
+            else if (clave == "movement") nodo->movement = (valor == "1" || valor == "true");
+            else if (clave == "speed") nodo->speed = valor.empty() ? 0 : std::stof(valor);
+            else if (clave == "rot") nodo->rotacion = valor.empty() ? 0 : std::stof(valor);
+            else if (clave == "collision_enabled") nodo->collision.enabled = (valor == "1" || valor == "true");
+            else if (clave == "collision_rot") nodo->collision.rotation = valor.empty() ? 0 : std::stof(valor);
+            else if (clave == "pos" || clave == "escala" || clave == "size" ||
+                clave == "collision_offset" || clave == "collision_size") {
+                size_t coma = valor.find(',');
+                if (coma != std::string::npos) {
+                    float a = std::stof(valor.substr(0, coma));
+                    float b = std::stof(valor.substr(coma + 1));
+                    if (clave == "pos") { nodo->posicion.x = a; nodo->posicion.y = b; }
+                    else if (clave == "escala") { nodo->escala.x = a; nodo->escala.y = b; }
+                    else if (clave == "size") { nodo->size.x = a; nodo->size.y = b; }
+                    else if (clave == "collision_offset") { nodo->collision.offset.x = a; nodo->collision.offset.y = b; }
+                    else if (clave == "collision_size") { nodo->collision.size.x = a; nodo->collision.size.y = b; }
+                }
+            }
+            else if (clave == "hijos") {
+                if (valor.size() >= 2 && valor[0] == '[' && valor.back() == ']') {
+                    std::string inner = valor.substr(1, valor.size() - 2);
+                    size_t pos = 0;
+                    while (pos < inner.size()) {
+                        while (pos < inner.size() && (inner[pos] == ',' || isspace(inner[pos]))) pos++;
+                        if (pos < inner.size() && inner[pos] == '{') {
+                            Nodo* hijo = leerNodo(inner, pos, nodo);
                             if (hijo) nodo->hijos.push_back(hijo);
                         }
                         else break;
                     }
-                    pos = arrPos + 1;
                 }
-                else pos++;
-            }
-            else
-            {
-                size_t dummy;
-                if (textoNodo[pos] == '"')
-                    ExtraerString(textoNodo, pos, dummy);
-                else if (textoNodo[pos] == '[')
-                {
-                    size_t finArray = textoNodo.find(']', pos);
-                    if (finArray != std::string::npos) pos = finArray + 1;
-                    else pos++;
-                }
-                else
-                    ExtraerNumero(textoNodo, pos, dummy);
             }
         }
-        else
-            pos++;
-    }
-    if (pos < textoNodo.size() && textoNodo[pos] == '}')
-        pos++;
-    return nodo;
-}
+        return nodo;
+        };
 
-bool Escena::Cargar(const std::string& ruta)
-{
-    std::ifstream archivo(ruta);
-    if (!archivo.is_open()) return false;
-    netejar();
-    std::stringstream buffer;
-    buffer << archivo.rdbuf();
-    std::string contenido = buffer.str();
-    size_t posRaiz = contenido.find("\"raiz\"");
-    if (posRaiz == std::string::npos) return false;
-    size_t inicioHijos = contenido.find('[', posRaiz);
-    if (inicioHijos == std::string::npos) return false;
-    size_t pos = inicioHijos + 1;
-    while (pos < contenido.size() && contenido[pos] != ']')
-    {
-        while (pos < contenido.size() && (contenido[pos] == ' ' || contenido[pos] == ',' || contenido[pos] == '\n'))
-            pos++;
-        if (contenido[pos] == '{')
-        {
-            Nodo* nodo = ParsearNodo(contenido, pos, raiz);
-            if (nodo) raiz->hijos.push_back(nodo);
+    size_t pos = 0;
+    while (pos < nodosStr.size()) {
+        while (pos < nodosStr.size() && (nodosStr[pos] == ',' || isspace(nodosStr[pos]))) pos++;
+        if (pos < nodosStr.size() && nodosStr[pos] == '{') {
+            Nodo* n = leerNodo(nodosStr, pos, raiz);
+            if (n) raiz->hijos.push_back(n);
         }
         else break;
     }
+
     modificado = false;
     return true;
 }

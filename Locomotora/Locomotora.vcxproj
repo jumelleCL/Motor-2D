@@ -55,6 +55,7 @@
     <ClInclude Include="libs\sdl3\include\SDL3\SDL_haptic.h" />
     <ClInclude Include="libs\sdl3\include\SDL3\SDL_hidapi.h" />
     <ClInclude Include="libs\sdl3\include\SDL3\SDL_hints.h" />
+    <ClInclude Include="libs\sdl3\include\SDL3\SDL_image.h" />
     <ClInclude Include="libs\sdl3\include\SDL3\SDL_init.h" />
     <ClInclude Include="libs\sdl3\include\SDL3\SDL_intrin.h" />
     <ClInclude Include="libs\sdl3\include\SDL3\SDL_iostream.h" />
@@ -229,7 +230,7 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalLibraryDirectories>
       </AdditionalLibraryDirectories>
-      <AdditionalDependencies>$(CoreLibraryDependencies);%(AdditionalDependencies);opengl32.lib;SDL3.lib;</AdditionalDependencies>
+      <AdditionalDependencies>$(CoreLibraryDependencies);%(AdditionalDependencies);opengl32.lib;SDL3.lib;SDL3_image.lib;</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
